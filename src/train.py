@@ -1,167 +1,304 @@
 import pandas as pd
+import numpy as np
+import joblib
 import mlflow
 import mlflow.sklearn
-import joblib
-import numpy as np
-import os
 
 from sklearn.model_selection import train_test_split
-from sklearn.ensemble import RandomForestRegressor, RandomForestClassifier
-from sklearn.metrics import accuracy_score, mean_squared_error
+from sklearn.preprocessing import LabelEncoder, StandardScaler
 
-from sklearn.pipeline import Pipeline
-from sklearn.compose import ColumnTransformer
-from sklearn.preprocessing import OneHotEncoder, StandardScaler
-
-from feature_engineering import create_features
-
-# =========================
-# ✅ Setup
-# =========================
-print("🚀 Starting training pipeline...")
-os.makedirs("models", exist_ok=True)
-
-# =========================
-# ✅ Load Data
-# =========================
-df = pd.read_csv('data/processed/final_data.csv')
-print(f"Original Shape: {df.shape}")
-
-# =========================
-# ✅ Reduce size (optional)
-# =========================
-if len(df) > 5000:
-    df = df.sample(5000, random_state=42)
-
-# =========================
-# ✅ Feature Engineering
-# =========================
-df = create_features(df)
-
-# 🔥 ENSURE Amenity_Score EXISTS
-if "Amenity_Score" not in df.columns:
-    print("⚠️ Amenity_Score missing → creating fallback")
-    df["Amenity_Score"] = 0
-
-# =========================
-# ❗ Drop unwanted
-# =========================
-df.drop(columns=["ID"], inplace=True, errors="ignore")
-
-# =========================
-# ❗ Handle Missing Values (CRITICAL FIX)
-# =========================
-df = df.fillna({
-    col: "Unknown" for col in df.select_dtypes(include="object").columns
-})
-
-df = df.fillna(0)
-
-# =========================
-# ✅ Targets
-# =========================
-y_reg = df['Future_Price_5Y']
-y_clf = df['Good_Investment']
-X = df.drop(['Future_Price_5Y', 'Good_Investment'], axis=1)
-
-# =========================
-# ✅ Column Types
-# =========================
-cat_cols = X.select_dtypes(include='object').columns.tolist()
-num_cols = X.select_dtypes(exclude='object').columns.tolist()
-
-# Remove high-cardinality
-cat_cols = [col for col in cat_cols if X[col].nunique() < 20]
-
-print("Categorical:", cat_cols)
-print("Numerical:", num_cols)
-
-# =========================
-# ✅ Preprocessing
-# =========================
-preprocessor = ColumnTransformer([
-    ("num", StandardScaler(), num_cols),
-    ("cat", OneHotEncoder(handle_unknown='ignore'), cat_cols)
-])
-
-# =========================
-# ✅ Pipelines
-# =========================
-reg_pipeline = Pipeline([
-    ("preprocessor", preprocessor),
-    ("model", RandomForestRegressor(
-        n_estimators=100,
-        max_depth=15,
-        n_jobs=-1,
-        random_state=42
-    ))
-])
-
-clf_pipeline = Pipeline([
-    ("preprocessor", preprocessor),
-    ("model", RandomForestClassifier(
-        n_estimators=100,
-        max_depth=15,
-        n_jobs=-1,
-        random_state=42
-    ))
-])
-
-# =========================
-# ✅ SINGLE SPLIT (FIXED)
-# =========================
-X_train, X_test, y_train_r, y_test_r, y_train_c, y_test_c = train_test_split(
-    X, y_reg, y_clf, test_size=0.2, random_state=42
+# Classification
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import (
+    RandomForestClassifier,
+    GradientBoostingClassifier,
+    ExtraTreesClassifier,
+    RandomForestRegressor,
+    GradientBoostingRegressor,
+    ExtraTreesRegressor
 )
 
-# =========================
-# ✅ Train
-# =========================
-print("🏋️ Training models...")
-reg_pipeline.fit(X_train, y_train_r)
-clf_pipeline.fit(X_train, y_train_c)
+from xgboost import XGBClassifier, XGBRegressor
 
-# =========================
-# ✅ Predict
-# =========================
-pred_r = reg_pipeline.predict(X_test)
-pred_c = clf_pipeline.predict(X_test)
+# Metrics
+from sklearn.metrics import (
+    accuracy_score,
+    precision_score,
+    recall_score,
+    roc_auc_score,
+    mean_absolute_error,
+    mean_squared_error,
+    r2_score
+)
 
-# =========================
-# ✅ Metrics
-# =========================
-rmse = np.sqrt(mean_squared_error(y_test_r, pred_r))
-acc = accuracy_score(y_test_c, pred_c)
+# ---------------------------------------------------
+# LOAD DATA
+# ---------------------------------------------------
 
-print(f"RMSE: {rmse}")
-print(f"Accuracy: {acc}")
+df = pd.read_csv("data/processed/final_data.csv")
 
-# =========================
-# ✅ MLflow (optional)
-# =========================
+# ---------------------------------------------------
+# FEATURE ENGINEERING
+# ---------------------------------------------------
+
+city_growth = {
+    "Chennai":0.11,
+    "Bangalore":0.14,
+    "Hyderabad":0.13,
+    "Mumbai":0.10,
+    "Delhi":0.09,
+    "Pune":0.12
+}
+
+df["Growth_Rate"] = df["City"].map(city_growth).fillna(0.08)
+
+df["Amenity_Density_Score"] = (
+    df["Amenities"].astype(str).str.count(",") + 1
+)
+
+df["Future_Price_5Y"] = (
+    df["Price_in_Lakhs"]
+    * ((1 + df["Growth_Rate"]) ** 5)
+)
+
+median_ppsft = df["Price_per_SqFt"].median()
+
+df["Good_Investment"] = (
+    (df["Growth_Rate"] >= 0.10) &
+    (df["Price_per_SqFt"] < median_ppsft) &
+    (df["Age_of_Property"] <= 15)
+).astype(int)
+
+transport_map = {
+    "Low": 1,
+    "Medium": 2,
+    "High": 3
+}
+
+df["Public_Transport_Accessibility"] = (
+    df["Public_Transport_Accessibility"]
+    .map(transport_map)
+)
+
+
+# Parking Space
 try:
-    mlflow.set_experiment("RealEstate_Final")
+    df["Parking_Space"] = pd.to_numeric(
+        df["Parking_Space"],
+        errors="raise"
+    )
+except:
+    parking_map = {
+        "No": 0,
+        "Yes": 1
+    }
 
-    with mlflow.start_run():
-        mlflow.log_metric("rmse", rmse)
-        mlflow.log_metric("accuracy", acc)
+    df["Parking_Space"] = (
+        df["Parking_Space"]
+        .map(parking_map)
+    )
 
-        mlflow.sklearn.log_model(reg_pipeline, "regressor")
-        mlflow.sklearn.log_model(clf_pipeline, "classifier")
+# ---------------------------------------------------
+# ENCODING
+# ---------------------------------------------------
 
-    print("📦 MLflow logged")
+encoders = {}
 
-except Exception as e:
-    print("⚠️ MLflow skipped:", e)
+cat_cols = [
+    "State",
+    "City",
+    "Property_Type",
+    "Furnished_Status",
+    "Security",
+    "Amenities",
+    "Facing",
+    "Owner_Type",
+    "Availability_Status"
+]
 
-# =========================
-# ✅ Save
-# =========================
-joblib.dump(reg_pipeline, "models/regressor.pkl")
-joblib.dump(clf_pipeline, "models/classifier.pkl")
+for col in cat_cols:
+    le = LabelEncoder()
+    df[col] = le.fit_transform(df[col].astype(str))
+    encoders[col] = le
 
-# 🔥 SAVE FEATURE LIST (IMPORTANT FOR APP)
-joblib.dump(X.columns.tolist(), "models/feature_columns.pkl")
+joblib.dump(encoders, "models/label_encoders.pkl")
 
-print("💾 Models saved successfully")
-print("🎉 DONE")
+# ---------------------------------------------------
+# FEATURES
+# ---------------------------------------------------
+
+drop_cols = [
+    "ID",
+    "Good_Investment",
+    "Future_Price_5Y"
+    
+]
+
+df.drop(columns=["Locality"], inplace=True)
+
+X = df.drop(columns=drop_cols)
+
+
+joblib.dump(
+    X.columns.tolist(),
+    "models/feature_columns.pkl"
+)
+
+y_class = df["Good_Investment"]
+y_reg = df["Future_Price_5Y"]
+
+# ---------------------------------------------------
+# SCALING
+# ---------------------------------------------------
+
+scaler = StandardScaler()
+print("\nRemaining object columns:")
+print(
+    df.select_dtypes(include="object")
+      .columns
+      .tolist()
+)
+
+X_scaled = scaler.fit_transform(X)
+
+joblib.dump(
+    scaler,
+    "models/scaler.pkl"
+)
+
+# ---------------------------------------------------
+# SPLIT
+# ---------------------------------------------------
+
+X_train_c, X_test_c, y_train_c, y_test_c = train_test_split(
+    X_scaled,
+    y_class,
+    test_size=0.2,
+    random_state=42
+)
+
+X_train_r, X_test_r, y_train_r, y_test_r = train_test_split(
+    X_scaled,
+    y_reg,
+    test_size=0.2,
+    random_state=42
+)
+
+# ---------------------------------------------------
+# CLASSIFICATION MODELS
+# ---------------------------------------------------
+
+classifiers = {
+    "LogisticRegression":
+        LogisticRegression(max_iter=1000),
+
+    "RandomForest":
+        RandomForestClassifier(),
+
+    "GradientBoosting":
+        GradientBoostingClassifier(),
+
+    "ExtraTrees":
+        ExtraTreesClassifier(),
+
+    "XGBoost":
+        XGBClassifier()
+}
+
+best_auc = 0
+
+for name, model in classifiers.items():
+
+    with mlflow.start_run(run_name=name):
+
+        model.fit(X_train_c, y_train_c)
+
+        preds = model.predict(X_test_c)
+
+        probs = model.predict_proba(X_test_c)[:,1]
+
+        acc = accuracy_score(y_test_c,preds)
+        prec = precision_score(y_test_c,preds)
+        rec = recall_score(y_test_c,preds)
+        auc = roc_auc_score(y_test_c,probs)
+
+        mlflow.log_param("model",name)
+        mlflow.log_metric("accuracy",acc)
+        mlflow.log_metric("precision",prec)
+        mlflow.log_metric("recall",rec)
+        mlflow.log_metric("roc_auc",auc)
+
+        mlflow.sklearn.log_model(model,name)
+
+        if auc > best_auc:
+            best_auc = auc
+            best_classifier = model
+
+joblib.dump(
+    best_classifier,
+    "models/best_classifier.pkl"
+)
+
+# ---------------------------------------------------
+# REGRESSION MODELS
+# ---------------------------------------------------
+
+from sklearn.linear_model import LinearRegression
+
+regressors = {
+
+    "LinearRegression":
+        LinearRegression(),
+
+    "RandomForest":
+        RandomForestRegressor(),
+
+    "GradientBoosting":
+        GradientBoostingRegressor(),
+
+    "ExtraTrees":
+        ExtraTreesRegressor(),
+
+    "XGBoost":
+        XGBRegressor()
+}
+
+best_r2 = -999
+
+for name, model in regressors.items():
+
+    with mlflow.start_run(run_name=name):
+
+        model.fit(X_train_r, y_train_r)
+
+        preds = model.predict(X_test_r)
+
+        rmse = np.sqrt(
+            mean_squared_error(y_test_r,preds)
+        )
+
+        mae = mean_absolute_error(
+            y_test_r,preds
+        )
+
+        r2 = r2_score(
+            y_test_r,preds
+        )
+
+        mlflow.log_param("model",name)
+        mlflow.log_metric("rmse",rmse)
+        mlflow.log_metric("mae",mae)
+        mlflow.log_metric("r2",r2)
+
+        mlflow.sklearn.log_model(model,name)
+
+        if r2 > best_r2:
+            best_r2 = r2
+            best_regressor = model
+
+joblib.dump(
+    best_regressor,
+    "models/best_regressor.pkl"
+)
+
+print("Training completed")
